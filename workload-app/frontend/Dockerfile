@@ -3,8 +3,8 @@ FROM mcr.microsoft.com/azurelinux/base/nodejs:24 AS build
 WORKDIR /app
 
 # Copy package files first for layer caching
-COPY package.json ./
-RUN npm ci
+COPY package.json package-lock.json* ./
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 # Copy remaining source and build
 COPY . .
