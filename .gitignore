@@ -80,6 +80,8 @@ dist-ssr/
 # ── Bicep / Azure deploy artefacts ───────────────────────────────────────────
 # Compiled ARM JSON next to .bicep files
 **/*.bicep.json
+# Compiled ARM JSON from bicep build (any .json sitting next to a .bicep)
+infra/**/*.json
 # Bicep build cache
 .bicep/
 # Local what-if / deployment output captures
