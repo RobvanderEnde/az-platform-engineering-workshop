@@ -1,0 +1,237 @@
+name: 'App Deploy'
+
+on:
+  push:
+    branches: [main]
+    paths: ['workload-app/**']
+  workflow_dispatch:
+    inputs:
+      backend-digest:
+        description: 'Backend image digest to deploy (skip build, e.g. sha256:abc123...)'
+        required: false
+      frontend-digest:
+        description: 'Frontend image digest to deploy (skip build, e.g. sha256:abc123...)'
+        required: false
+
+env:
+  ACR_NAME: crhotelbookingtestzteed5i524ots
+  BACKEND_REPO: hotelbooking/backend
+  FRONTEND_REPO: hotelbooking/frontend
+
+permissions:
+  contents: read
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  #  Stage 1 — Build both images once, emit digests
+  # ────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build Images
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.backend-digest == '' || github.event.inputs.frontend-digest == '' }}
+    environment: test
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      backend-digest: ${{ steps.backend.outputs.digest }}
+      frontend-digest: ${{ steps.frontend.outputs.digest }}
+      acr-login-server: ${{ steps.acr.outputs.loginServer }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve ACR login server
+        id: acr
+        run: |
+          LOGIN_SERVER=$(az acr show --name "${{ env.ACR_NAME }}" --query loginServer --output tsv)
+          echo "loginServer=$LOGIN_SERVER" >> "$GITHUB_OUTPUT"
+
+      - name: Build backend image
+        id: backend
+        run: |
+          TAG="${{ github.sha }}"
+          BUILD_OUTPUT=$(az acr build \
+            --registry "${{ env.ACR_NAME }}" \
+            --image "${{ env.BACKEND_REPO }}:${TAG}" \
+            --file workload-app/backend/HotelBooking.Api/Dockerfile \
+            workload-app/backend/HotelBooking.Api \
+            2>&1)
+          echo "$BUILD_OUTPUT"
+          DIGEST=$(echo "$BUILD_OUTPUT" | grep -oP 'digest: sha256:\K[a-f0-9]+' | tail -1)
+          echo "digest=sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "### Backend image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.acr.outputs.loginServer }}/${{ env.BACKEND_REPO }}@sha256:${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build frontend image
+        id: frontend
+        run: |
+          TAG="${{ github.sha }}"
+          BUILD_OUTPUT=$(az acr build \
+            --registry "${{ env.ACR_NAME }}" \
+            --image "${{ env.FRONTEND_REPO }}:${TAG}" \
+            --file workload-app/frontend/Dockerfile \
+            workload-app/frontend \
+            2>&1)
+          echo "$BUILD_OUTPUT"
+          DIGEST=$(echo "$BUILD_OUTPUT" | grep -oP 'digest: sha256:\K[a-f0-9]+' | tail -1)
+          echo "digest=sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "### Frontend image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.acr.outputs.loginServer }}/${{ env.FRONTEND_REPO }}@sha256:${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  Stage 2 — Deploy to test (auto-approved)
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy-test:
+    name: Deploy Test
+    needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment: test
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      backend-digest: ${{ steps.resolve.outputs.backend-digest }}
+      frontend-digest: ${{ steps.resolve.outputs.frontend-digest }}
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve digests
+        id: resolve
+        run: |
+          BACKEND="${{ github.event.inputs.backend-digest || needs.build.outputs.backend-digest }}"
+          FRONTEND="${{ github.event.inputs.frontend-digest || needs.build.outputs.frontend-digest }}"
+          ACR_SERVER="${{ needs.build.outputs.acr-login-server }}"
+          if [ -z "$ACR_SERVER" ]; then
+            ACR_SERVER=$(az acr show --name "${{ env.ACR_NAME }}" --query loginServer --output tsv)
+          fi
+          echo "backend-digest=$BACKEND" >> "$GITHUB_OUTPUT"
+          echo "frontend-digest=$FRONTEND" >> "$GITHUB_OUTPUT"
+          echo "acr-login-server=$ACR_SERVER" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy backend to test
+        run: |
+          IMAGE="${{ steps.resolve.outputs.acr-login-server }}/${{ env.BACKEND_REPO }}@${{ steps.resolve.outputs.backend-digest }}"
+          echo "Deploying backend: $IMAGE"
+          az containerapp update \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name ca-hotelapi-test-001 \
+            --image "$IMAGE" \
+            --output none
+
+      - name: Deploy frontend to test
+        run: |
+          IMAGE="${{ steps.resolve.outputs.acr-login-server }}/${{ env.FRONTEND_REPO }}@${{ steps.resolve.outputs.frontend-digest }}"
+          echo "Deploying frontend: $IMAGE"
+          az containerapp update \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name ca-hotelfrontend-test-001 \
+            --image "$IMAGE" \
+            --output none
+
+      - name: Write deployed digests to summary
+        run: |
+          echo "### Test deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | Digest |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Backend | \`${{ steps.resolve.outputs.backend-digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Frontend | \`${{ steps.resolve.outputs.frontend-digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  Stage 3 — Smoke test
+  # ────────────────────────────────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test
+    needs: deploy-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for rollout
+        run: sleep 30
+
+      - name: Smoke test frontend
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://ca-hotelfrontend-test-001.lemonground-ef726f4e.swedencentral.azurecontainerapps.io/")
+          echo "Frontend HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Frontend returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Smoke test API
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://ca-hotelfrontend-test-001.lemonground-ef726f4e.swedencentral.azurecontainerapps.io/api/hotels")
+          echo "API HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::API returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  Stage 4 — Deploy to prod (reviewer-gated, same digest as test)
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy-prod:
+    name: Deploy Prod
+    needs: [deploy-test, smoke-test]
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve ACR login server
+        id: acr
+        run: |
+          LOGIN_SERVER=$(az acr show --name "${{ env.ACR_NAME }}" --query loginServer --output tsv)
+          echo "loginServer=$LOGIN_SERVER" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy backend to prod
+        run: |
+          IMAGE="${{ steps.acr.outputs.loginServer }}/${{ env.BACKEND_REPO }}@${{ needs.deploy-test.outputs.backend-digest }}"
+          echo "Deploying backend: $IMAGE"
+          az containerapp update \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name ca-hotelapi-prod-001 \
+            --image "$IMAGE" \
+            --output none
+
+      - name: Deploy frontend to prod
+        run: |
+          IMAGE="${{ steps.acr.outputs.loginServer }}/${{ env.FRONTEND_REPO }}@${{ needs.deploy-test.outputs.frontend-digest }}"
+          echo "Deploying frontend: $IMAGE"
+          az containerapp update \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name ca-hotelfrontend-prod-001 \
+            --image "$IMAGE" \
+            --output none
+
+      - name: Write deployed digests to summary
+        run: |
+          echo "### Prod deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | Digest |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Backend | \`${{ needs.deploy-test.outputs.backend-digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Frontend | \`${{ needs.deploy-test.outputs.frontend-digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Same digests as test — build-once, promote-everywhere._" >> "$GITHUB_STEP_SUMMARY"
