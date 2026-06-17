@@ -49,6 +49,7 @@ param acrLoginServer string
 param tags object = {
   workload: workloadName
   environment: environmentName
+  managedBy: 'bicep'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
