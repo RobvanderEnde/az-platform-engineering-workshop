@@ -1,0 +1,226 @@
+name: 'Infrastructure Deploy'
+
+on:
+  push:
+    branches: [main]
+    paths: ['infra/**']
+  workflow_dispatch: {}
+
+# Workflow-level constants
+env:
+  SHARED_RG: rg-workload-shared
+  HUB_RG: rg-platform
+  HUB_VNET_NAME: vnet-hub
+
+permissions:
+  contents: read
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  #  Stage 1 — Lint (no Azure login)
+  # ────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint shared template
+        run: az bicep build --file infra/shared/main.bicep
+
+      - name: Lint workload template
+        run: az bicep build --file infra/workload/main.bicep
+
+      - name: Lint spoke template
+        run: az bicep build --file infra/spoke.bicep
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  Stage 2 — Deploy shared infrastructure (ACR)
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy-shared:
+    name: Deploy Shared (ACR)
+    needs: lint
+    runs-on: ubuntu-latest
+    environment: test
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      acrResourceId: ${{ steps.deploy.outputs.acrResourceId }}
+      acrLoginServer: ${{ steps.deploy.outputs.acrLoginServer }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure shared resource group
+        run: |
+          az group create \
+            --name "${{ env.SHARED_RG }}" \
+            --location swedencentral \
+            --tags workload=hotelbooking environment=shared \
+            --output none
+
+      - name: What-if shared
+        run: |
+          az deployment group what-if \
+            --resource-group "${{ env.SHARED_RG }}" \
+            --template-file infra/shared/main.bicep \
+            --no-pretty-print \
+            | tee /tmp/shared-whatif.txt
+          echo '### Shared infra what-if' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/shared-whatif.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy shared
+        id: deploy
+        run: |
+          RESULT=$(az deployment group create \
+            --resource-group "${{ env.SHARED_RG }}" \
+            --template-file infra/shared/main.bicep \
+            --name "shared-$(date +%Y%m%d%H%M%S)" \
+            --query 'properties.outputs' \
+            --output json)
+
+          echo "acrResourceId=$(echo "$RESULT" | jq -r '.acrResourceId.value')" >> "$GITHUB_OUTPUT"
+          echo "acrLoginServer=$(echo "$RESULT" | jq -r '.acrLoginServer.value')" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  Stage 3 — Deploy test environment
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy-test:
+    name: Deploy Test
+    needs: deploy-shared
+    runs-on: ubuntu-latest
+    environment: test
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve VNet IDs
+        id: vnets
+        run: |
+          SPOKE_VNET_ID=$(az network vnet list \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --query '[0].id' --output tsv)
+          HUB_VNET_ID=$(az network vnet show \
+            --resource-group "${{ env.HUB_RG }}" \
+            --name "${{ env.HUB_VNET_NAME }}" \
+            --query id --output tsv)
+          echo "spokeVnetId=$SPOKE_VNET_ID" >> "$GITHUB_OUTPUT"
+          echo "hubVnetId=$HUB_VNET_ID" >> "$GITHUB_OUTPUT"
+
+      - name: What-if test
+        run: |
+          az deployment group what-if \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/workload/main.bicep \
+            --parameters infra/workload/main.test.bicepparam \
+            --parameters \
+              spokeVnetResourceId="${{ steps.vnets.outputs.spokeVnetId }}" \
+              hubVnetResourceId="${{ steps.vnets.outputs.hubVnetId }}" \
+              acrResourceId="${{ needs.deploy-shared.outputs.acrResourceId }}" \
+              acrLoginServer="${{ needs.deploy-shared.outputs.acrLoginServer }}" \
+            --no-pretty-print \
+            | tee /tmp/test-whatif.txt
+          echo '### Test infra what-if' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/test-whatif.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy test
+        run: |
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/workload/main.bicep \
+            --parameters infra/workload/main.test.bicepparam \
+            --parameters \
+              spokeVnetResourceId="${{ steps.vnets.outputs.spokeVnetId }}" \
+              hubVnetResourceId="${{ steps.vnets.outputs.hubVnetId }}" \
+              acrResourceId="${{ needs.deploy-shared.outputs.acrResourceId }}" \
+              acrLoginServer="${{ needs.deploy-shared.outputs.acrLoginServer }}" \
+            --name "test-$(date +%Y%m%d%H%M%S)"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  Stage 4 — Deploy prod environment (gated by reviewer)
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy-prod:
+    name: Deploy Prod
+    needs: [deploy-shared, deploy-test]
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve VNet IDs
+        id: vnets
+        run: |
+          SPOKE_VNET_ID=$(az network vnet list \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --query '[0].id' --output tsv)
+          HUB_VNET_ID=$(az network vnet show \
+            --resource-group "${{ env.HUB_RG }}" \
+            --name "${{ env.HUB_VNET_NAME }}" \
+            --query id --output tsv)
+          echo "spokeVnetId=$SPOKE_VNET_ID" >> "$GITHUB_OUTPUT"
+          echo "hubVnetId=$HUB_VNET_ID" >> "$GITHUB_OUTPUT"
+
+      - name: What-if prod
+        run: |
+          az deployment group what-if \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/workload/main.bicep \
+            --parameters infra/workload/main.prod.bicepparam \
+            --parameters \
+              spokeVnetResourceId="${{ steps.vnets.outputs.spokeVnetId }}" \
+              hubVnetResourceId="${{ steps.vnets.outputs.hubVnetId }}" \
+              acrResourceId="${{ needs.deploy-shared.outputs.acrResourceId }}" \
+              acrLoginServer="${{ needs.deploy-shared.outputs.acrLoginServer }}" \
+            --no-pretty-print \
+            | tee /tmp/prod-whatif.txt
+          echo '### Prod infra what-if' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/prod-whatif.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy prod
+        run: |
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/workload/main.bicep \
+            --parameters infra/workload/main.prod.bicepparam \
+            --parameters \
+              spokeVnetResourceId="${{ steps.vnets.outputs.spokeVnetId }}" \
+              hubVnetResourceId="${{ steps.vnets.outputs.hubVnetId }}" \
+              acrResourceId="${{ needs.deploy-shared.outputs.acrResourceId }}" \
+              acrLoginServer="${{ needs.deploy-shared.outputs.acrLoginServer }}" \
+            --name "prod-$(date +%Y%m%d%H%M%S)"
