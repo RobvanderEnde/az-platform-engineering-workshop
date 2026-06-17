@@ -39,9 +39,11 @@ param sqlDatabaseSku object = {
 @description('Auto-pause delay in minutes for the serverless SQL database (-1 to disable).')
 param sqlAutoPauseDelay int = 60
 
-@description('SKU for the Azure Container Registry.')
-@allowed(['Basic', 'Standard', 'Premium'])
-param acrSku string = 'Basic'
+@description('Resource ID of the shared container registry (from deploy-shared stage).')
+param acrResourceId string
+
+@description('Login server of the shared container registry (from deploy-shared stage).')
+param acrLoginServer string
 
 @description('Tags applied to all resources.')
 param tags object = {
@@ -56,7 +58,6 @@ param tags object = {
 var regionShort = location // used in names as-is (e.g. swedencentral)
 var runtimeMiName = 'id-${workloadName}-${environmentName}-001'
 var deployMiName = 'id-deploy-${workloadName}-${environmentName}-001'
-var acrName = 'cr${workloadName}${environmentName}${uniqueString(resourceGroup().id)}'
 var logAnalyticsName = 'log-${workloadName}-${environmentName}-001'
 var appInsightsName = 'appi-${workloadName}-${environmentName}-001'
 var caeName = 'cae-${workloadName}-${environmentName}-${regionShort}-001'
@@ -133,33 +134,17 @@ module deployMi 'br/public:avm/res/managed-identity/user-assigned-identity:0.5.1
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Container Registry (public, admin disabled, shared across envs)
+//  ACR Role Assignment — AcrPull for runtime MI on the shared registry
 // ─────────────────────────────────────────────────────────────────────────────
 
-module acr 'br/public:avm/res/container-registry/registry:0.12.1' = {
-  name: 'acr-deployment'
+var acrResourceGroupName = split(acrResourceId, '/')[4]
+
+module acrPullRoleAssignment '../shared/acr-role-assignment.bicep' = {
+  name: 'acr-pull-role-assignment'
+  scope: resourceGroup(acrResourceGroupName)
   params: {
-    name: acrName
-    location: location
-    acrSku: acrSku
-    acrAdminUserEnabled: false
-    publicNetworkAccess: 'Enabled'
-    networkRuleSetDefaultAction: 'Allow'
-    roleAssignments: [
-      {
-        // Runtime MI — AcrPull for image pulls
-        principalId: runtimeMi.outputs.principalId
-        roleDefinitionIdOrName: '7f951dda-4ed3-4680-a7ca-43fe172d538d' // AcrPull
-        principalType: 'ServicePrincipal'
-      }
-      {
-        // Deploy MI — AcrPush for CI/CD image builds
-        principalId: deployMi.outputs.principalId
-        roleDefinitionIdOrName: '8311e382-0749-4cb8-b61a-304f252e45ec' // AcrPush
-        principalType: 'ServicePrincipal'
-      }
-    ]
-    tags: tags
+    acrResourceId: acrResourceId
+    principalId: runtimeMi.outputs.principalId
   }
 }
 
@@ -307,7 +292,7 @@ module backendApp 'br/public:avm/res/app/container-app:0.22.1' = {
     }
     registries: [
       {
-        server: acr.outputs.loginServer
+        server: acrLoginServer
         identity: runtimeMi.outputs.resourceId
       }
     ]
@@ -374,7 +359,7 @@ module frontendApp 'br/public:avm/res/app/container-app:0.22.1' = {
     }
     registries: [
       {
-        server: acr.outputs.loginServer
+        server: acrLoginServer
         identity: runtimeMi.outputs.resourceId
       }
     ]
@@ -422,8 +407,8 @@ output runtimeMiClientId string = runtimeMi.outputs.clientId
 output runtimeMiPrincipalId string = runtimeMi.outputs.principalId
 output deployMiResourceId string = deployMi.outputs.resourceId
 output deployMiClientId string = deployMi.outputs.clientId
-output acrLoginServer string = acr.outputs.loginServer
-output acrResourceId string = acr.outputs.resourceId
+output acrLoginServer string = acrLoginServer
+output acrResourceId string = acrResourceId
 output sqlServerFqdn string = sqlServer.outputs.fullyQualifiedDomainName
 output containerAppsEnvironmentId string = containerAppsEnv.outputs.resourceId
 output backendAppName string = backendApp.outputs.name
