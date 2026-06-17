@@ -58,33 +58,37 @@ jobs:
         id: backend
         run: |
           TAG="${{ github.sha }}"
-          BUILD_OUTPUT=$(az acr build \
+          az acr build \
             --registry "${{ env.ACR_NAME }}" \
             --image "${{ env.BACKEND_REPO }}:${TAG}" \
             --file workload-app/backend/HotelBooking.Api/Dockerfile \
-            workload-app/backend/HotelBooking.Api \
-            2>&1)
-          echo "$BUILD_OUTPUT"
-          DIGEST=$(echo "$BUILD_OUTPUT" | grep -oP 'digest: sha256:\K[a-f0-9]+' | tail -1)
-          echo "digest=sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+            workload-app/backend/HotelBooking.Api
+          DIGEST=$(az acr manifest show-metadata \
+            --registry "${{ env.ACR_NAME }}" \
+            --name "${{ env.BACKEND_REPO }}" \
+            --tag "${TAG}" \
+            --query digest --output tsv)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "### Backend image" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`${{ steps.acr.outputs.loginServer }}/${{ env.BACKEND_REPO }}@sha256:${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.acr.outputs.loginServer }}/${{ env.BACKEND_REPO }}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build frontend image
         id: frontend
         run: |
           TAG="${{ github.sha }}"
-          BUILD_OUTPUT=$(az acr build \
+          az acr build \
             --registry "${{ env.ACR_NAME }}" \
             --image "${{ env.FRONTEND_REPO }}:${TAG}" \
             --file workload-app/frontend/Dockerfile \
-            workload-app/frontend \
-            2>&1)
-          echo "$BUILD_OUTPUT"
-          DIGEST=$(echo "$BUILD_OUTPUT" | grep -oP 'digest: sha256:\K[a-f0-9]+' | tail -1)
-          echo "digest=sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+            workload-app/frontend
+          DIGEST=$(az acr manifest show-metadata \
+            --registry "${{ env.ACR_NAME }}" \
+            --name "${{ env.FRONTEND_REPO }}" \
+            --tag "${TAG}" \
+            --query digest --output tsv)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "### Frontend image" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`${{ steps.acr.outputs.loginServer }}/${{ env.FRONTEND_REPO }}@sha256:${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.acr.outputs.loginServer }}/${{ env.FRONTEND_REPO }}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
 
   # ────────────────────────────────────────────────────────────────────────────
   #  Stage 2 — Deploy to test (auto-approved)
@@ -159,7 +163,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Wait for rollout
-        run: sleep 30
+        run: sleep 90
 
       - name: Smoke test frontend
         run: |
@@ -173,11 +177,16 @@ jobs:
 
       - name: Smoke test API
         run: |
-          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-            "https://ca-hotelfrontend-test-001.lemonground-ef726f4e.swedencentral.azurecontainerapps.io/api/hotels")
-          echo "API HTTP status: $HTTP_CODE"
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 400 ]; then
-            echo "::error::API returned HTTP $HTTP_CODE"
+          for i in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              "https://ca-hotelfrontend-test-001.lemonground-ef726f4e.swedencentral.azurecontainerapps.io/api/hotels")
+            echo "Attempt $i: API HTTP status: $HTTP_CODE"
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::API returned HTTP $HTTP_CODE after 5 attempts"
             exit 1
           fi
 
