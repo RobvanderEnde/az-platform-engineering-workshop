@@ -63,11 +63,10 @@ jobs:
             --image "${{ env.BACKEND_REPO }}:${TAG}" \
             --file workload-app/backend/HotelBooking.Api/Dockerfile \
             workload-app/backend/HotelBooking.Api
-          DIGEST=$(az acr manifest show-metadata \
+          DIGEST=$(az acr manifest list-metadata \
             --registry "${{ env.ACR_NAME }}" \
             --name "${{ env.BACKEND_REPO }}" \
-            --tag "${TAG}" \
-            --query digest --output tsv)
+            --query "[?tags[?@ == '${TAG}']].digest | [0]" --output tsv)
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "### Backend image" >> "$GITHUB_STEP_SUMMARY"
           echo "\`${{ steps.acr.outputs.loginServer }}/${{ env.BACKEND_REPO }}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
@@ -81,11 +80,10 @@ jobs:
             --image "${{ env.FRONTEND_REPO }}:${TAG}" \
             --file workload-app/frontend/Dockerfile \
             workload-app/frontend
-          DIGEST=$(az acr manifest show-metadata \
+          DIGEST=$(az acr manifest list-metadata \
             --registry "${{ env.ACR_NAME }}" \
             --name "${{ env.FRONTEND_REPO }}" \
-            --tag "${TAG}" \
-            --query digest --output tsv)
+            --query "[?tags[?@ == '${TAG}']].digest | [0]" --output tsv)
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "### Frontend image" >> "$GITHUB_STEP_SUMMARY"
           echo "\`${{ steps.acr.outputs.loginServer }}/${{ env.FRONTEND_REPO }}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
